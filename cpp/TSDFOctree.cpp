@@ -42,6 +42,7 @@ void Load(unsigned short *depth, unsigned char *color, const char *depth_fname, 
 	cvRelease( (void **)&freiburg_color);
 }
 
+
 void CreatePointCloud(const char *depth_fname, const char *color_fname, std::vector<Eigen::Vector3f> &points, std::vector<Eigen::Vector3d> &colors){
 	static unsigned short depth[640*480*2];
 	static unsigned char color[640*480*4];
@@ -246,14 +247,185 @@ void SavePointCloud(const std::vector<Eigen::Vector3f> &points, const std::vecto
 
 
 
+class TSDFOctree{
+public:
+	TSDFOctree(float resolution){
+		tsdf = new octomap::ColorOcTree(resolution);
+	}
+
+	void IntegrateData(unsigned short *depth, unsigned char *color, Eigen::Matrix<float, 3, 3, Eigen::RowMajor> &R, Eigen::Vector3f &T){
+		int size = 512;
+		int cellsPerMeter = 128;
+		float step = (1.0 / (float)cellsPerMeter) ;
+
+		std::vector<Eigen::Vector3f> points;
+		std::vector<Eigen::Vector3d> colors;
+
+		Eigen::Vector3f point;
+		Eigen::Vector3f lambda;
+	
+		float mu = 0.01;
+		for(int row = 0; row < size; row ++){
+			for(int col = 0; col < size; col ++){
+				for(int z = 0; z < size; z ++){
+					//Convert from grid coordinate to 3D point
+						point.x() = (float)(col - size/2)*step;
+						point.y() = (float)(row - size/2)*step;
+						point.z() = (float)(z+cellsPerMeter/2)*step;
+
+					//Project point onto image plane
+						float x = point.x()*525 / point.z() + 319.5;
+						float y = point.y()*525 / point.z() + 239.5;
+
+						if(x < 0 || x >= 640 || y < 0 || y >= 480)
+							continue;
+
+
+					/*int index = ((int)y * 640 + (int)x)*2 + 1;
+					int color_index = ( (int)y*640 + (int)x )*4;
+*/
+					int index = ((int)y * 640 + (int)x);
+					int color_index = ( (int)y*640 + (int)x )*3;
+					float val = (float)depth[index]*0.001;
+
+					lambda.x() = (x-319.5) / 525;
+					lambda.y() = (y-239.5) / 525;
+					lambda.z() = 1;
+				
+
+					float sd = val - 1.0 / (lambda.norm()) * point.norm();
+	
+					sd > mu ? mu : sd;
+					sd < -mu ? -mu : sd;
+
+					point = R*point + T;
+				
+					//search for a node at the specified point
+					ColorOcTreeNode *node = tsdf->search( octomap::point3d (point.x(),point.y(),point.z()), 0 );
+					if(node == NULL){
+						if(fabs(sd) < mu){ //no node and signed distance is below truncation
+							int red = (int)color[color_index+2];
+							int green = (int)color[color_index+1];
+							int blue = (int)color[color_index];
+						
+							octomap::ColorOcTreeNode *new_node = tsdf->updateNode(octomap::point3d (point.x(),point.y(),point.z()), true);
+							new_node->setValue(sd);
+							new_node->setColor(blue,green,red);
+						}
+					}else if(sd > 0){ //node exists and is "behind" the surface
+						float newVal = (sd + node->getValue())/2; //compute new value for node
+						if( fabs(newVal) < mu ){ //update node if it still below truncation, otherwise delete node
+							node->setValue(newVal);
+						}
+						else
+							tsdf->deleteNode(octomap::point3d (point.x(),point.y(),point.z()));
+					}			
+				}
+			}
+		}
+	}
+
+	void SurfaceEstimation(Eigen::Matrix<float, 3, 3, Eigen::RowMajor> &R, Eigen::Vector3f &T){
+		octomap::KeyRay keys;
+
+		octomap::point3d end;
+		
+		//octomap::point3d direction(0,0,1);
+		octomap::point3d start(T.x(), T.y(), T.z());
+		octomap::point3d coord;
+		octomap::point3d zeroCrossing;
+		IplImage *img = cvCreateImage(cvSize(640,480), IPL_DEPTH_8U, 1);
+
+		printf("Starting estimation\n");
+		for(int row = 0; row < 480; row++){
+			for(int col = 0; col < 640; col++){
+
+				//Compute direction of ray passing through pixel (col, row)
+				float X = ( (float)col - 319.5) / 525.f;
+				float Y = ( (float)row - 239.5) / 525.f;
+
+				octomap::point3d direction(X,Y,1);
+				direction.normalize();
+			
+				if( tsdf->castRay( octomap::point3d(T.x(), T.y(), T.z()), direction, end, true) ){ //ray hit an occupied cell
+					tsdf->computeRayKeys(end, end + direction*tsdf->getResolution()*10, keys); //trace nodes near first hit cell
+					float prev_val;
+
+
+					for(std::vector<octomap::OcTreeKey>::iterator key_itr = keys.begin(); key_itr < keys.end(); key_itr++){ //find zero crossing
+						octomap::ColorOcTreeNode *node = tsdf->search(*key_itr);
+				
+						if(node != '\0'){
+							octomap::point3d temp = tsdf->keyToCoord(*key_itr);
+							//printf("%f\t(%f %f %f)\n", node->getValue(), temp.x(), temp.y(), temp.z());
+
+							if(key_itr == keys.begin()){
+								coord = tsdf->keyToCoord(*key_itr);
+								prev_val = node->getValue();
+								continue;
+							}
+							else{
+								if(prev_val / fabs(prev_val) != node->getValue() / fabs(node->getValue()) ){ //changed sign
+									//printf("SIGN CHANGE\n");
+									//printf("prev = %f, curr = %f\n", prev_val, node->getValue());
+									//printf("prev = (%f %f %f)\tcurr = (%f %f %f)\n", coord.x(), coord.y(), coord.z(), temp.x(), temp.y(), temp.z());
+
+									float distance = fabs(node->getValue() - prev_val);
+									float alpha = fabs(prev_val) / distance;
+									zeroCrossing = coord + (temp - coord) * alpha;
+
+									//printf("alpha = %f\n", alpha);
+									//printf("zero crossing = (%f %f %f)\n", zeroCrossing.x(), zeroCrossing.y(), zeroCrossing.z());
+
+									break;
+								}else{ //didnt change sign
+									coord = tsdf->keyToCoord(*key_itr);
+									prev_val = node->getValue();
+								}
+							}
+
+					
+						}
+				
+					}
+
+					cvSet2D(img, row, col, cvScalar(zeroCrossing.z()/.0078));
+				}else{
+					cvSet2D(img, row, col, cvScalar(0));
+				}
+			}
+		}
+		printf("done\n");
+
+		cvNamedWindow("surface", CV_WINDOW_AUTOSIZE);
+		cvShowImage("surface", img);
+		cvWaitKey(0);
+		/*printf("%f %f %f\n", end.x(), end.y(), end.z());
+
+		tsdf->computeRayKeys(octomap::point3d(T.x(), T.y(), T.z()), octomap::point3d(T.x(), T.y(), T.z()+10), keys);
+		
+		octomap::KeyRay::iterator key_itr = keys.begin();
+		printf("%d\n", keys.size());
+		for(; key_itr != keys.end(); key_itr++){
+			
+		}*/
+
+
+	}
+
+	octomap::ColorOcTree &GetTSDF(){ return *tsdf; }
+
+private:
+	octomap::ColorOcTree *tsdf;
+};
 
 void CreateTSDF(const char *depth_fname, const char *color_fname, octomap::ColorOcTree &tree, Eigen::Matrix<float, 3, 3, Eigen::RowMajor> &R, Eigen::Vector3f &T){
 	int size = 512;
 	int cellsPerMeter = 128;
 	float step = (1.0 / (float)cellsPerMeter) ;
 
-	static unsigned short depth[640*480*2];
-	static unsigned char color[640*480*4];
+	static unsigned short depth[640*480];
+	static unsigned char color[640*480*3];
 	Load(depth, color, depth_fname, color_fname);
 
 	std::vector<Eigen::Vector3f> points;
@@ -266,10 +438,6 @@ void CreateTSDF(const char *depth_fname, const char *color_fname, octomap::Color
 	for(int row = 0; row < size; row ++){
 		for(int col = 0; col < size; col ++){
 			for(int z = 0; z < size; z ++){
-
-				//row = 256;
-				//col = 256;
-
 				point.x() = (float)(col - size/2)*step;
 				point.y() = (float)(row - size/2)*step;
 				point.z() = (float)(z+cellsPerMeter/2)*step;
@@ -296,7 +464,6 @@ void CreateTSDF(const char *depth_fname, const char *color_fname, octomap::Color
 				sd < -mu ? -mu : sd;
 
 				point = R*point + T;
-				//tree.coordToKey( octomap::point3d (point.x(),point.y(),point.z()) );
 				
 				ColorOcTreeNode *node = tree.search( octomap::point3d (point.x(),point.y(),point.z()), 0 );
 				if(node == NULL){
@@ -309,30 +476,57 @@ void CreateTSDF(const char *depth_fname, const char *color_fname, octomap::Color
 						int green = (int)color[color_index+1];
 						int blue = (int)color[color_index];
 						
-						octomap::ColorOcTreeNode *new_node = tree.updateNode(octomap::point3d (point.x(),point.y(),point.z()), true);//->setValue(bitStack(sd,red,green,blue,mu));
+						octomap::ColorOcTreeNode *new_node = tree.updateNode(octomap::point3d (point.x(),point.y(),point.z()), true);
 						new_node->setValue(sd);
 						new_node->setColor(blue,green,red);
 					}
 				}else if(sd > 0){
-					//float newVal = (sd + getSDF(node->getValue(), mu))/2;
 					float newVal = (sd + node->getValue())/2;
 					if( fabs(newVal) < mu ){
 						node->setValue(newVal);
 					}
 					else
 						tree.deleteNode(octomap::point3d (point.x(),point.y(),point.z()));
-				}
-				
-
-				
+				}			
 			}
 		}
 	}
-	//SavePointCloud(points,colors);
-	//PointsFromOctree(tree);
 }
 
+
+
+void Load2(unsigned short *depth, unsigned char *color, const char *depth_fname, const char *color_fname){
+	char fname[1000];
+	sprintf(fname, "depth/%s", depth_fname);
+	IplImage *freiburg_depth = cvLoadImage(fname, CV_LOAD_IMAGE_ANYDEPTH | CV_LOAD_IMAGE_ANYCOLOR);
+	
+	char *ptr = freiburg_depth->imageData;
+	unsigned short temp[640*480];
+
+	cvNamedWindow("depth", CV_WINDOW_AUTOSIZE);
+	cvShowImage("depth", freiburg_depth);
+	cvWaitKey(25);
+	for(int i = 0; i < 640*480; i++, ptr += sizeof(unsigned short)){
+		memcpy(&(depth[i]), ptr, sizeof(unsigned short));
+		depth[i] /= 5;
+	}
+	cvRelease( (void **)&freiburg_depth);
+
+	//color
+	sprintf(fname, "rgb/%s", color_fname);
+	IplImage *freiburg_color = cvLoadImage(fname, CV_LOAD_IMAGE_ANYDEPTH | CV_LOAD_IMAGE_ANYCOLOR);
+	for(int i = 0; i < 640*480; i++){
+		color[i*3] = freiburg_color->imageData[i*3];
+		color[i*3+1] = freiburg_color->imageData[i*3+1];
+		color[i*3+2] = freiburg_color->imageData[i*3+2];
+	}
+	cvRelease( (void **)&freiburg_color);
+}
+
+
+
 int main(int argc, char *argv[]){
+
 	if(atoi(argv[1]) == -1){
 		system("del  associatedImages.txt");
 		system("del  imagesWithTraj.txt");
@@ -353,14 +547,11 @@ int main(int argc, char *argv[]){
 	int counter = 0;
 	Eigen::Vector3f center;
 
-	std::vector<Eigen::Vector3f> points;
-	std::vector<Eigen::Vector3d> colors;
-	octomap::ColorOcTree tree(0.02);
-	octomap::ColorOcTree tsdf_tree(0.02);
-	
-	float tsdf[512*512*512];
+	unsigned short *depth = (unsigned short *)malloc(640*480*sizeof(unsigned short));
+	unsigned char *color = (unsigned char *)malloc(640*480*3*sizeof(unsigned short));
 
-	
+	TSDFOctree tsdf(0.01);
+
 	while(1){
 		if(fscanf(fptr, "%lf %s %lf %s %lf %f %f %f %f %f %f %f", &timestamp, &depth_name[0], &timestamp, &color_name[0], &timestamp, &x, &y, &z, &i, &j, &k, &w) < 1)
 			break;
@@ -370,11 +561,10 @@ int main(int argc, char *argv[]){
 			center.x() = x;
 			center.y() = y;
 			center.z() = z;
-		
 		}
 		Eigen::Matrix<float, 3, 3, Eigen::RowMajor> R = (q).RotationMatrix();
 		
-		printf("%s\n", depth_name);
+		
 		fprintf(trajFptr, "%f %f %f %f %f %f %f %f %f %f %f %f %f %f %f %f\n", R(0,0), R(0,1), R(0,2), 0,
 																			   R(1,0), R(1,1), R(1,2), 0,
 																			   R(2,0), R(2,1), R(2,2), 0,
@@ -391,23 +581,26 @@ int main(int argc, char *argv[]){
 		token = strtok(color_name, search);
 		color_fname = strtok(NULL, search);
 	
-		//CreateOctree(depth_fname, color_fname, tree, R, Eigen::Vector3f(x,y,z));
 		counter++;
-		printf("%d\n", counter);
-		//if(counter > 50)
-			//break;
-		//CreatePointCloud(depth_fname, color_fname, points, colors);
-		//SavePointCloud(points, colors);
-		CreateTSDF(depth_fname, color_fname, tsdf_tree, R, Eigen::Vector3f(x,y,z));
+		printf("%d.) ", counter);
+		printf("%s %s\n", depth_fname, color_fname);
+		Load2(depth, color, depth_fname, color_fname);
+		cout << R << endl << endl;
+		printf("%f %f %f\n", x, y, z);
+
+		R(0,0) = 1;	R(0,1) = 0;	R(0,2) = 0;
+		R(1,0) = 0;	R(1,1) = 1;	R(1,2) = 0;
+		R(2,0) = 0;	R(2,1) = 0;	R(2,2) = 1;
+
+		tsdf.IntegrateData(depth, color, R, Eigen::Vector3f(0,0,0));
+		tsdf.SurfaceEstimation(R, Eigen::Vector3f(0,0,0));
+
+		//CreateTSDF(depth_fname, color_fname, tsdf_tree, R, Eigen::Vector3f(x,y,z));
 		if(counter == atoi(argv[1]))
 			break;
 	}
 
-	FILE *size = fopen("sizes.txt","w");
-	fprintf(size, "OCC Tree = %d\nTSDF Tree = %d\n", tree.memoryUsage(), tsdf_tree.memoryUsage());
-	fclose(size);
-
 	//PointsFromOctree(tree, "occCloud.ply");
-	PointsFromOctree(tsdf_tree, "tsdfCloud.ply");
+	//PointsFromOctree(tsdf.GetTSDF(), "tsdfCloud.ply");
 	fclose(trajFptr);
 }
